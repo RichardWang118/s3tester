@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -74,13 +75,62 @@ func Options(client *http.Client, endpoint string) error {
 	return nil
 }
 
+var (
+	putBody     *DummyReader
+	putMD5      string
+	prepareOnce sync.Once
+	mutexlock   sync.RWMutex
+)
+
+func prepareSharedPut(size int64, seed string) {
+	prepareOnce.Do(func() {
+		dr := NewDummyReader(size, seed)
+
+		md5str, err := encodeMD5(dr)
+		if err != nil {
+			log.Fatalf("failed to precompute MD5: %v", err)
+		}
+
+		if _, err := dr.Seek(0, io.SeekStart); err != nil {
+			log.Fatalf("failed to reset DummyReader: %v", err)
+		}
+
+		putBody = dr
+		putMD5 = md5str
+	})
+}
+
+func accessSharedBody() *DummyReader {
+	mutexlock.RLock()
+	defer mutexlock.RUnlock()
+	putBody.Seek(0, io.SeekStart)
+	return putBody
+}
+
 // Put performs an S3 PUT to the given bucket and key using the supplied configuration
 func Put(ctx context.Context, svc S3API, bucket, key, tagging string, size int64, metadata map[string]string) error {
-	obj := NewDummyReader(size, key)
+	// shared path
+	if putBody != nil {
+		params := &s3.PutObjectInput{
+			Bucket:        aws.String(bucket),
+			Key:           aws.String(key),
+			ContentLength: &size,
+			ContentMD5:    aws.String(putMD5),
+			Body:          accessSharedBody(),
+			Metadata:      metadata,
+		}
+		if tagging != "" {
+			params.Tagging = aws.String(tagging)
+		}
+		_, err := svc.PutObject(ctx, params)
+		return err
+	}
 
+	// fallback path (original behavior)
+	obj := NewDummyReader(size, key)
 	contentMD5, err := encodeMD5(obj)
 	if err != nil {
-		return fmt.Errorf("Calculating MD5 failed for multipart object bucket: %s, key: %s, err: %v", bucket, key, err)
+		return fmt.Errorf("calculating MD5 failed for %s/%s: %w", bucket, key, err)
 	}
 
 	params := &s3.PutObjectInput{
@@ -91,13 +141,10 @@ func Put(ctx context.Context, svc S3API, bucket, key, tagging string, size int64
 		Body:          obj,
 		Metadata:      metadata,
 	}
-
 	if tagging != "" {
 		params.Tagging = aws.String(tagging)
 	}
-
 	_, err = svc.PutObject(ctx, params)
-
 	return err
 }
 

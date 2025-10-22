@@ -196,6 +196,10 @@ func (ds *DurationSetting) enabled() bool {
 }
 
 func runtest(ctx context.Context, config *Config, args Parameters, sysInterruptHandler SyscallHandler) results {
+	if args.Operation == "put" && args.MixedWorkload == "" && args.max == 0 {
+		prepareSharedPut(int64(args.Size), args.Prefix)
+	}
+
 	c := make(chan Result, args.Concurrency)
 	startTime := time.Now()
 	sysInterruptHandler.setTestStartTime(startTime)
